@@ -147,6 +147,45 @@ def load_leadscore(file_like):
     return master
 
 
+def load_rd_station(file_like):
+    """
+    Le o export de leads da RD Station (Email, Nome, Telefone, Datas de conversao,
+    Eventos etc). Usa 'Data da ultima conversao' como proxy de ultima navegacao/
+    engajamento no site, pois o export nao traz timestamp por evento de navegacao.
+    Aceita .csv (utf-16 ou utf-8, separador ; ou ,) ou .xlsx.
+    """
+    name = getattr(file_like, 'name', str(file_like))
+    if str(name).lower().endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(file_like)
+    else:
+        raw_bytes = file_like.read() if hasattr(file_like, 'read') else open(file_like, 'rb').read()
+        df = None
+        for enc in ('utf-16', 'utf-8', 'latin1'):
+            try:
+                import io as _io
+                df = pd.read_csv(_io.BytesIO(raw_bytes), sep=None, engine='python', encoding=enc)
+                if df.shape[1] > 1:
+                    break
+            except Exception:
+                df = None
+        if df is None or df.shape[1] <= 1:
+            raise ValueError('Nao foi possivel ler o arquivo da RD Station (encoding/separador nao reconhecido).')
+
+    col_email = next((c for c in df.columns if c.strip().lower() == 'email'), None)
+    col_ultima = next((c for c in df.columns if 'ltima convers' in c.lower()), None)
+    if col_email is None or col_ultima is None:
+        raise ValueError("Arquivo da RD Station precisa ter as colunas 'Email' e 'Data da ultima conversao'.")
+
+    out = df[[col_email, col_ultima]].rename(columns={col_email: 'Email', col_ultima: 'Data_Ultima_Navegacao_RD'})
+    out['Email_norm'] = out['Email'].astype(str).str.strip().str.lower()
+    out['Data_Ultima_Navegacao_RD'] = pd.to_datetime(
+        out['Data_Ultima_Navegacao_RD'].astype(str).str.replace(r'\s*[-+]\d{4}$', '', regex=True),
+        errors='coerce')
+    out = out.dropna(subset=['Data_Ultima_Navegacao_RD'])
+    out = out.sort_values('Data_Ultima_Navegacao_RD').drop_duplicates(subset='Email_norm', keep='last')
+    return out[['Email_norm', 'Data_Ultima_Navegacao_RD']]
+
+
 def aggregate_customers(spot_df, exact_keywords, similar_keywords, familia, ref_date=None):
     if ref_date is None:
         ref_date = pd.Timestamp.today().normalize()
@@ -225,7 +264,7 @@ def _cross_eligibility(pool, lead_master):
 
 def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw, familia,
                    tamanho=400, min_pedidos=3, dias_exclusao=30, limite_fallback=100,
-                   ref_date=None):
+                   ref_date=None, rd_df=None, dias_navegacao=360):
     exact_kw = _norm_keywords(exact_keywords_raw)
     similar_kw = _norm_keywords(similar_keywords_raw)
 
@@ -287,6 +326,34 @@ def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw
             combinado2 = combinado2.sort_values(['ordem', 'RFV_score'], ascending=[True, False]).drop(columns='ordem')
             resultado = combinado2
 
+    # ---------------- Criterio extra: navegacao recente (RD Station) ----------------
+    if rd_df is not None and len(rd_df):
+        resultado = resultado.merge(rd_df, on='Email_norm', how='left')
+        resultado['Dias_Desde_Ultima_Navegacao_RD'] = (
+            (ref_date if ref_date is not None else pd.Timestamp.today().normalize())
+            - resultado['Data_Ultima_Navegacao_RD']
+        ).dt.days
+        resultado['Navegou_Recente'] = resultado['Dias_Desde_Ultima_Navegacao_RD'] <= dias_navegacao
+        funil.append((f"+ Navegaram no site nos ultimos {dias_navegacao}d (RD Station)",
+                      int(resultado['Navegou_Recente'].sum())))
+    else:
+        resultado['Navegou_Recente'] = np.nan
+        resultado['Dias_Desde_Ultima_Navegacao_RD'] = np.nan
+
+    if 'Origem' in resultado.columns:
+        ordem_origem = {'Fase 1 - Produto exato': 0, 'Fallback A - Estilo similar': 1, 'Fallback B - Familia': 2}
+        resultado['_ordem_origem'] = resultado['Origem'].map(ordem_origem).fillna(0)
+    else:
+        resultado['_ordem_origem'] = 0
+
+    if rd_df is not None and len(rd_df):
+        resultado['_ordem_nav'] = (~resultado['Navegou_Recente'].fillna(False)).astype(int)
+        resultado = resultado.sort_values(
+            ['_ordem_origem', '_ordem_nav', 'RFV_score'], ascending=[True, True, False])
+    else:
+        resultado = resultado.sort_values(['_ordem_origem', 'RFV_score'], ascending=[True, False])
+    resultado = resultado.drop(columns=[c for c in ['_ordem_origem', '_ordem_nav'] if c in resultado.columns])
+
     final = resultado.head(tamanho).copy()
     final['Telefone (WhatsApp)'] = final['Telefone_final'].apply(_fmt_phone_whatsapp)
     final['RFV_score'] = final['RFV_score'].round(1)
@@ -296,7 +363,8 @@ def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw
 
     cols_out = ['#', 'Nome', 'Telefone (WhatsApp)', 'Email_norm', 'Cidade', 'UF', 'Segmento',
                 'Origem', 'Qtd_Pedidos_Exato', 'Qtd_Pedidos', 'Valor_Total',
-                'Dias_Desde_Ultima_Compra', 'Assinante_Ativo_Hoje', 'RFV_score']
+                'Dias_Desde_Ultima_Compra', 'Navegou_Recente', 'Dias_Desde_Ultima_Navegacao_RD',
+                'Assinante_Ativo_Hoje', 'RFV_score']
     for c in cols_out:
         if c not in final.columns:
             final[c] = np.nan
@@ -306,6 +374,8 @@ def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw
         'Qtd_Pedidos': 'Qtd. pedidos totais',
         'Valor_Total': 'Valor total comprado (R$)',
         'Dias_Desde_Ultima_Compra': 'Dias desde ultima compra',
+        'Navegou_Recente': f'Navegou no site (ult. {dias_navegacao}d)',
+        'Dias_Desde_Ultima_Navegacao_RD': 'Dias desde ultima navegacao (RD)',
         'Assinante_Ativo_Hoje': 'Assinante ativo hoje',
         'RFV_score': 'Score RFV (0-100)',
     })
