@@ -19,6 +19,14 @@ FASE 2 (fallback, acionado quando o publico elegivel da Fase 1 fica abaixo de um
   Camada B - Familia/categoria generica (so preenche o que a Camada A nao cobrir): usa a
              coluna de familia oficial do arquivo de pedidos (LEVES, LUPULADAS, FRUTADAS,
              MALTADAS, COMPLEXAS, TORRADAS, AZEDAS, Sem Alcool, KITs).
+
+BASE DE E-MAIL (2a via de disparo, definido em 18/08/2026):
+  Usa o Lead Score como base mae (todos os leads com opt-in de e-mail = 'Sim'), cruzada
+  com a afinidade de produto/RFV vinda dos Pedidos, em camadas de prioridade (A/B/C iguais
+  a Fase 1 + fallback do WhatsApp) mais uma Camada D exclusiva para leads engajados que
+  nunca compraram (usa o proprio Lead Score/Segmento para priorizar). Antes de gerar, nega
+  (remove) qualquer e-mail que ja apareceu em um disparo anterior da RD Station para a
+  mesma oferta.
 """
 
 import re
@@ -107,6 +115,15 @@ def _valid_phone(p):
 
 def _fmt_phone_whatsapp(p):
     return _normalize_phone_br(p) or ''
+
+
+def _valid_email(e):
+    if not isinstance(e, str):
+        return False
+    e = e.strip()
+    if not e or e.lower() in ('nan', 'none'):
+        return False
+    return bool(re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', e))
 
 
 def _norm_keywords(raw):
@@ -219,6 +236,40 @@ def load_rd_station(file_like):
     out = out.dropna(subset=['Data_Ultima_Navegacao_RD'])
     out = out.sort_values('Data_Ultima_Navegacao_RD').drop_duplicates(subset='Email_norm', keep='last')
     return out[['Email_norm', 'Data_Ultima_Navegacao_RD']]
+
+
+def load_rd_abertos(file_like):
+    """
+    Le uma lista de e-mails ja impactados/abertos em um disparo da RD Station (export de
+    um segmento/filtro feito dentro da propria RD, ex.: 'quem abriu esta campanha'). So usa
+    a coluna 'Email' - qualquer e-mail presente no arquivo e considerado 'ja aberto' e sera
+    negativado (removido) da nova base de e-mail gerada para a mesma oferta.
+    Aceita .csv (utf-16 ou utf-8, separador ; ou ,) ou .xlsx.
+    """
+    name = getattr(file_like, 'name', str(file_like))
+    if str(name).lower().endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(file_like)
+    else:
+        raw_bytes = file_like.read() if hasattr(file_like, 'read') else open(file_like, 'rb').read()
+        df = None
+        for enc in ('utf-16', 'utf-8', 'latin1'):
+            try:
+                import io as _io
+                df = pd.read_csv(_io.BytesIO(raw_bytes), sep=None, engine='python', encoding=enc)
+                if df.shape[1] > 1:
+                    break
+            except Exception:
+                df = None
+        if df is None or df.shape[1] <= 1:
+            raise ValueError('Nao foi possivel ler o arquivo de abertos da RD (encoding/separador nao reconhecido).')
+
+    col_email = next((c for c in df.columns if c.strip().lower() == 'email'), None)
+    if col_email is None:
+        raise ValueError("Arquivo de abertos da RD precisa ter uma coluna 'Email'.")
+
+    emails = df[col_email].astype(str).str.strip().str.lower()
+    emails = emails[emails.apply(_valid_email)]
+    return set(emails)
 
 
 def aggregate_customers(spot_df, exact_keywords, similar_keywords, familia, ref_date=None):
@@ -416,3 +467,166 @@ def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw
     })
 
     return {'tabela': final, 'funil': funil, 'modo': modo}
+
+
+def _engagement_rank(segmento):
+    if not isinstance(segmento, str):
+        return 3
+    s = segmento.lower()
+    if 'quente' in s:
+        return 0
+    if 'morno' in s:
+        return 1
+    if 'frio' in s:
+        return 2
+    return 3
+
+
+def gerar_publico_email(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw, familia,
+                         tamanho_alvo=None, min_pedidos=3, dias_exclusao=30, ref_date=None,
+                         rd_abertos_emails=None, rd_df=None, dias_navegacao=360):
+    """
+    Gera uma base de e-mail (2a via de disparo, complementar ao WhatsApp e a RD Station),
+    usando o Lead Score como base mae (todos os leads com opt-in de e-mail = 'Sim'),
+    cruzada com a afinidade de produto/RFV vinda dos Pedidos, em camadas de prioridade:
+
+      Camada A - Produto exato (mesma logica da Fase 1 do WhatsApp)
+      Camada B - Estilo similar (sem exigir o produto exato)
+      Camada C - Familia generica do produto
+      Camada D - Leads engajados sem historico de compra (ordenados pelo proprio Lead Score
+                 e pela temperatura do Segmento: Quente > Morno > Frio)
+
+    Antes de montar as camadas, remove (nega) qualquer e-mail que ja apareceu em um disparo
+    anterior da RD Station para esta mesma oferta (rd_abertos_emails).
+    """
+    exact_kw = _norm_keywords(exact_keywords_raw)
+    similar_kw = _norm_keywords(similar_keywords_raw)
+
+    agg = aggregate_customers(spot_df, exact_kw, similar_kw, familia, ref_date=ref_date)
+    funil = []
+
+    lead_pool = lead_master.copy()
+    lead_pool = lead_pool[lead_pool['Email_norm'].apply(_valid_email)]
+    funil.append(("Base Lead Score - e-mails validos", len(lead_pool)))
+
+    lead_pool = lead_pool[lead_pool['Opt_Email_Netdeal'] == 'Sim']
+    funil.append(("+ Opt-in de e-mail = 'Sim'", len(lead_pool)))
+
+    if rd_abertos_emails:
+        lead_pool = lead_pool[~lead_pool['Email_norm'].isin(rd_abertos_emails)]
+        funil.append(("- Negativado (ja abriu disparo da RD para esta oferta)", len(lead_pool)))
+
+    merged = lead_pool.merge(
+        agg.drop(columns=['Telefone']), on='Email_norm', how='left', suffixes=('', '_pedidos'))
+    for c in ['Nome', 'Cidade', 'UF']:
+        pcol = f'{c}_pedidos'
+        if pcol in merged.columns:
+            merged[c] = merged[c].fillna(merged[pcol])
+            merged = merged.drop(columns=[pcol])
+
+    for c in ['Qtd_Pedidos', 'Valor_Total', 'Qtd_Pedidos_Exato']:
+        merged[c] = merged[c].fillna(0)
+    for c in ['Ja_Comprou_Exato', 'Ja_Comprou_Similar_Estilo', 'Ja_Comprou_Familia']:
+        merged[c] = np.where(merged[c].isna(), False, merged[c]).astype(bool)
+
+    condA = (
+        merged['Ja_Comprou_Exato'] & merged['Ja_Comprou_Similar_Estilo'] &
+        (merged['Qtd_Pedidos'] >= min_pedidos) &
+        ((merged['Dias_Desde_Ultima_Compra_Exato'] > dias_exclusao) | merged['Dias_Desde_Ultima_Compra_Exato'].isna())
+    )
+    poolA = merged[condA].copy()
+    poolA = _add_rfv(poolA)
+    poolA['Origem'] = 'Camada A - Produto exato'
+    funil.append(("Camada A - produto exato + estilo + pedidos minimos", len(poolA)))
+
+    restante = merged[~merged['Email_norm'].isin(poolA['Email_norm'])]
+    condB = (
+        restante['Ja_Comprou_Similar_Estilo'] &
+        (restante['Qtd_Pedidos'] >= min_pedidos) &
+        ((restante['Dias_Desde_Ultima_Compra_Exato'] > dias_exclusao) | restante['Dias_Desde_Ultima_Compra_Exato'].isna())
+    )
+    poolB = restante[condB].copy()
+    poolB = _add_rfv(poolB)
+    poolB['Origem'] = 'Camada B - Estilo similar'
+    funil.append(("Camada B - estilo similar (fallback)", len(poolB)))
+
+    restante2 = restante[~restante['Email_norm'].isin(poolB['Email_norm'])]
+    origem_c = f"Camada C - Familia '{familia}'"
+    if familia in FAMILIAS:
+        condC = (
+            restante2['Ja_Comprou_Familia'] &
+            (restante2['Qtd_Pedidos'] >= min_pedidos) &
+            ((restante2['Dias_Desde_Ultima_Compra_Exato'] > dias_exclusao) | restante2['Dias_Desde_Ultima_Compra_Exato'].isna())
+        )
+    else:
+        condC = pd.Series(False, index=restante2.index)
+    poolC = restante2[condC].copy()
+    poolC = _add_rfv(poolC)
+    poolC['Origem'] = origem_c
+    funil.append((f"Camada C - familia '{familia}' (fallback)", len(poolC)))
+
+    restante3 = restante2[~restante2['Email_norm'].isin(poolC['Email_norm'])]
+    poolD = restante3[restante3['Qtd_Pedidos'] == 0].copy()
+    poolD['RFV_score'] = poolD['Lead_Score'].rank(pct=True) * 100
+    poolD['Origem'] = 'Camada D - Engajado sem compra'
+    funil.append(("Camada D - engajados sem historico de compra", len(poolD)))
+
+    for p in (poolA, poolB, poolC):
+        p['_eng_rank'] = -1  # sempre antes da Camada D na ordenacao final
+    poolD['_eng_rank'] = poolD['Segmento'].apply(_engagement_rank)
+
+    combinado = pd.concat([poolA, poolB, poolC, poolD], ignore_index=True)
+    combinado = combinado.drop_duplicates(subset='Email_norm', keep='first')
+
+    ordem_origem = {'Camada A - Produto exato': 0, 'Camada B - Estilo similar': 1,
+                     origem_c: 2, 'Camada D - Engajado sem compra': 3}
+    combinado['_ordem'] = combinado['Origem'].map(ordem_origem).fillna(9)
+
+    if rd_df is not None and len(rd_df):
+        combinado = combinado.merge(rd_df, on='Email_norm', how='left')
+        combinado['Dias_Desde_Ultima_Navegacao_RD'] = (
+            (ref_date if ref_date is not None else pd.Timestamp.today().normalize())
+            - combinado['Data_Ultima_Navegacao_RD']
+        ).dt.days
+        combinado['Navegou_Recente'] = combinado['Dias_Desde_Ultima_Navegacao_RD'] <= dias_navegacao
+        combinado['_ordem_nav'] = (~combinado['Navegou_Recente'].fillna(False)).astype(int)
+        combinado = combinado.sort_values(
+            ['_ordem', '_eng_rank', '_ordem_nav', 'RFV_score'], ascending=[True, True, True, False])
+    else:
+        combinado['Navegou_Recente'] = np.nan
+        combinado['Dias_Desde_Ultima_Navegacao_RD'] = np.nan
+        combinado = combinado.sort_values(['_ordem', '_eng_rank', 'RFV_score'], ascending=[True, True, False])
+
+    funil.append(("Total combinado (A+B+C+D), antes do corte de tamanho", len(combinado)))
+
+    if tamanho_alvo:
+        final = combinado.head(int(tamanho_alvo)).copy()
+    else:
+        final = combinado.copy()
+
+    final['RFV_score'] = final['RFV_score'].round(1)
+    final['Valor_Total'] = final['Valor_Total'].round(2)
+    final = final.reset_index(drop=True)
+    final.insert(0, '#', range(1, len(final) + 1))
+
+    cols_out = ['#', 'Nome', 'Email_norm', 'Cidade', 'UF', 'Segmento', 'Origem',
+                'Qtd_Pedidos_Exato', 'Qtd_Pedidos', 'Valor_Total', 'Dias_Desde_Ultima_Compra',
+                'Navegou_Recente', 'Dias_Desde_Ultima_Navegacao_RD', 'Lead_Score',
+                'Assinante_Ativo_Hoje', 'RFV_score']
+    for c in cols_out:
+        if c not in final.columns:
+            final[c] = np.nan
+    final = final[cols_out].rename(columns={
+        'Email_norm': 'Email',
+        'Qtd_Pedidos_Exato': 'Qtd. pedidos c/ produto exato',
+        'Qtd_Pedidos': 'Qtd. pedidos totais',
+        'Valor_Total': 'Valor total comprado (R$)',
+        'Dias_Desde_Ultima_Compra': 'Dias desde ultima compra',
+        'Navegou_Recente': f'Navegou no site (ult. {dias_navegacao}d)',
+        'Dias_Desde_Ultima_Navegacao_RD': 'Dias desde ultima navegacao (RD)',
+        'Lead_Score': 'Lead Score',
+        'Assinante_Ativo_Hoje': 'Assinante ativo hoje',
+        'RFV_score': 'Score de priorizacao (0-100)',
+    })
+
+    return {'tabela': final, 'funil': funil}

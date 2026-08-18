@@ -6,7 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from segmentation import (
-    gerar_publico, load_spot_pedidos, load_leadscore, load_rd_station, FAMILIAS,
+    gerar_publico, gerar_publico_email, load_spot_pedidos, load_leadscore,
+    load_rd_station, load_rd_abertos, FAMILIAS,
 )
 
 st.set_page_config(page_title="Publico Segmentado - Clube do Malte", layout="wide")
@@ -106,7 +107,8 @@ with col2:
                                 help="Estilos parecidos, usados no criterio 2 e na Camada A do fallback.")
     familia = st.selectbox("Familia do produto (Camada B do fallback)", FAMILIAS)
 
-rodar = st.button("Gerar publico", type="primary", use_container_width=True)
+st.subheader("1. Base de WhatsApp")
+rodar = st.button("Gerar publico (WhatsApp)", type="primary", use_container_width=True)
 
 if rodar:
     if not SPOT_PATH.exists() or not LEAD_PATH.exists():
@@ -168,8 +170,94 @@ if rodar:
         fname = f"Publico_{(nome_oferta or 'oferta').strip().replace(' ', '_')[:40]}.xlsx"
         st.download_button("Baixar Excel", data=buf, file_name=fname,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True)
+                            use_container_width=True, key="download_wapp")
 else:
     st.info("As bases de Pedidos e Lead Score ficam salvas no app — so precisa subir de novo quando quiser "
             "atualizar. RD Station e opcional, pensada pra subir toda semana. Preencha os dados da oferta e "
-            "clique em 'Gerar publico'.")
+            "clique em 'Gerar publico (WhatsApp)'.")
+
+st.divider()
+st.subheader("2. Base de E-mail (2ª via de disparo)")
+st.caption("Usa o Lead Score como base mae (inclui leads engajados que nunca compraram) cruzado com a "
+           "mesma afinidade de produto da oferta acima. Suba a lista de quem ja ABRIU um disparo anterior "
+           "da RD Station para negativar (remover) esses e-mails da nova base.")
+
+rd_abertos_up = st.file_uploader(
+    "Lista de e-mails que ja ABRIRAM o disparo desta oferta na RD Station (opcional)",
+    type=["csv", "xlsx"], key="rd_abertos_up")
+
+tamanho_email_label = st.select_slider(
+    "Tamanho aproximado da base de e-mail",
+    options=["500", "1.000", "2.500", "5.000", "Toda a base elegivel"],
+    value="2.500",
+)
+
+gerar_email = st.button("Gerar base de e-mail", type="primary", use_container_width=True)
+
+if gerar_email:
+    if not SPOT_PATH.exists() or not LEAD_PATH.exists():
+        st.error("Faltam bases obrigatorias. Suba a base de Pedidos e o Lead Score na barra lateral antes de gerar.")
+    elif not exact_kw:
+        st.error("Informe ao menos uma palavra-chave do produto exato no bloco 'Oferta' acima.")
+    else:
+        spot_df = _load_spot_cached(str(SPOT_PATH), SPOT_PATH.stat().st_mtime)
+        lead_master = _load_lead_cached(str(LEAD_PATH), LEAD_PATH.stat().st_mtime)
+        rd_df = None
+        if RD_PATH.exists():
+            rd_df = _load_rd_cached(str(RD_PATH), RD_PATH.stat().st_mtime)
+
+        rd_abertos_emails = None
+        if rd_abertos_up is not None:
+            try:
+                rd_abertos_emails = load_rd_abertos(rd_abertos_up)
+                st.info(f"{len(rd_abertos_emails)} e-mails da RD serao negativados (ja abriram esta oferta).")
+            except Exception as e:
+                st.error(f"Nao foi possivel ler o arquivo de abertos da RD: {e}")
+
+        tamanho_alvo = None if tamanho_email_label == "Toda a base elegivel" else int(
+            tamanho_email_label.replace(".", ""))
+
+        with st.spinner("Calculando a base de e-mail..."):
+            resultado_email = gerar_publico_email(
+                spot_df, lead_master,
+                exact_keywords_raw=exact_kw,
+                similar_keywords_raw=similar_kw,
+                familia=familia,
+                tamanho_alvo=tamanho_alvo,
+                min_pedidos=int(min_pedidos),
+                dias_exclusao=int(dias_exclusao),
+                rd_abertos_emails=rd_abertos_emails,
+                rd_df=rd_df,
+                dias_navegacao=int(dias_navegacao),
+            )
+
+        tabela_email = resultado_email['tabela']
+        funil_email = resultado_email['funil']
+
+        st.success(f"Base de e-mail gerada: {len(tabela_email)} contatos.")
+
+        st.subheader("Funil de aplicacao dos criterios (e-mail)")
+        funil_email_df = pd.DataFrame(funil_email, columns=["Etapa", "Qtd. de clientes"])
+        st.dataframe(funil_email_df, hide_index=True, use_container_width=True)
+
+        if 'Origem' in tabela_email.columns:
+            st.subheader("Composicao por camada")
+            st.dataframe(tabela_email['Origem'].value_counts().rename_axis('Origem').reset_index(name='Qtd.'),
+                        hide_index=True, use_container_width=True)
+
+        st.subheader("Base de e-mail final")
+        st.dataframe(tabela_email, hide_index=True, use_container_width=True)
+
+        buf_email = io.BytesIO()
+        with pd.ExcelWriter(buf_email, engine="openpyxl") as writer:
+            tabela_email.to_excel(writer, sheet_name="Base_Email", index=False)
+            funil_email_df.to_excel(writer, sheet_name="Funil", index=False)
+        buf_email.seek(0)
+
+        fname_email = f"Email_{(nome_oferta or 'oferta').strip().replace(' ', '_')[:40]}.xlsx"
+        st.download_button("Baixar Excel (E-mail)", data=buf_email, file_name=fname_email,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True, key="download_email")
+else:
+    st.info("Preencha os dados da oferta acima (mesmos campos usados no WhatsApp), suba opcionalmente a "
+            "lista de quem ja abriu na RD, escolha o tamanho aproximado e clique em 'Gerar base de e-mail'.")
