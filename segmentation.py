@@ -272,6 +272,96 @@ def load_rd_abertos(file_like):
     return set(emails)
 
 
+def sha256_email(email):
+    """
+    SHA-256 (hex, minusculo) do e-mail em minusculas - mesmo formato usado pelo site
+    do Clube do Malte como User-ID do GA4 quando o visitante esta logado (descoberto
+    e confirmado em 18/08/2026 comparando o hash capturado numa requisicao real do
+    GA4 contra e-mails conhecidos do Douglas). Usado para cruzar a base do Lead Score/
+    Spot com a audiencia "Navegou Recente" exportada do GA4.
+    """
+    import hashlib
+    if not isinstance(email, str) or not email.strip():
+        return None
+    return hashlib.sha256(email.strip().lower().encode('utf-8')).hexdigest()
+
+
+def ga4_credentials_available(ga4_service_account_info, ga4_property_id, ga4_audience_id):
+    return bool(ga4_service_account_info) and bool(ga4_property_id) and bool(ga4_audience_id)
+
+
+def load_ga4_navegou_recente(ga4_service_account_info, ga4_property_id, ga4_audience_id,
+                              page_size=100000, timeout_s=600):
+    """
+    Busca, via GA4 Audience Export API (Data API v1beta), os hashes de e-mail dos
+    usuarios que sao membros da audiencia "Navegou Recente" configurada no GA4
+    (evento session_start, janela de dias definida na propria audiencia - hoje 360
+    dias, ver Admin > Publicos-alvo no GA4). Cada membro vem identificado pela
+    dimensao 'userId' - o User-ID enviado em tagging, que no site do Clube do Malte
+    e o SHA-256(email em minusculas) de quem estava logado na sessao.
+
+    Cada chamada cria um novo audience export (a API nao permite reconsultar um
+    export antigo por audiencia - todo `create` gera uma nova foto dos dados).
+    Aguarda o processamento (normalmente 1-5 min) e pagina o resultado ate trazer
+    todos os membros.
+
+    Retorna um set() com os hashes SHA-256 (64 chars hex, minusculo) encontrados.
+    Levanta excecao se a API falhar (credenciais erradas, ID de audiencia errado,
+    audiencia recem-criada ainda sem membros processados - o GA4 leva ate 24-48h
+    apos a criacao de uma audiencia nova para o primeiro calculo -, timeout etc).
+    Quem chama essa funcao deve tratar a excecao e cair de volta para o fluxo sem
+    o criterio de navegacao, sem quebrar o app.
+    """
+    from google.oauth2 import service_account
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import (
+        AudienceExport, AudienceDimension, CreateAudienceExportRequest,
+        QueryAudienceExportRequest,
+    )
+
+    creds = service_account.Credentials.from_service_account_info(dict(ga4_service_account_info))
+    client = BetaAnalyticsDataClient(credentials=creds)
+
+    property_path = f"properties/{ga4_property_id}"
+    audience_path = f"{property_path}/audiences/{ga4_audience_id}"
+
+    audience_export = AudienceExport(
+        audience=audience_path,
+        dimensions=[AudienceDimension(dimension_name="userId")],
+    )
+    operation = client.create_audience_export(
+        CreateAudienceExportRequest(parent=property_path, audience_export=audience_export)
+    )
+    # create_audience_export e uma operacao de longa duracao (LRO) - .result() ja faz
+    # o polling internamente ate o export ficar pronto (ou levanta excecao se falhar).
+    export_meta = operation.result(timeout=timeout_s)
+
+    hashes = set()
+    offset = 0
+    while True:
+        resp = client.query_audience_export(QueryAudienceExportRequest(
+            name=export_meta.name, offset=offset, limit=page_size,
+        ))
+        rows = list(resp.audience_rows)
+        for row in rows:
+            val = row.dimension_values[0].value
+            if val:
+                hashes.add(val.strip().lower())
+        offset += len(rows)
+        if not rows or offset >= resp.row_count:
+            break
+
+    return hashes
+
+
+def match_ga4_navegou(email_norm_series, ga4_hashes):
+    """Casa uma serie de e-mails normalizados (minusculo) contra o set de hashes
+    SHA-256 vindo do GA4 (load_ga4_navegou_recente), retornando uma Serie booleana."""
+    if not ga4_hashes:
+        return pd.Series(False, index=email_norm_series.index)
+    return email_norm_series.apply(sha256_email).isin(ga4_hashes)
+
+
 def aggregate_customers(spot_df, exact_keywords, similar_keywords, familia, ref_date=None):
     if ref_date is None:
         ref_date = pd.Timestamp.today().normalize()
@@ -350,7 +440,7 @@ def _cross_eligibility(pool, lead_master):
 
 def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw, familia,
                    tamanho=400, min_pedidos=3, dias_exclusao=30, limite_fallback=100,
-                   ref_date=None, rd_df=None, dias_navegacao=360):
+                   ref_date=None, rd_df=None, dias_navegacao=360, ga4_navegou_hashes=None):
     exact_kw = _norm_keywords(exact_keywords_raw)
     similar_kw = _norm_keywords(similar_keywords_raw)
 
@@ -412,8 +502,14 @@ def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw
             combinado2 = combinado2.sort_values(['ordem', 'RFV_score'], ascending=[True, False]).drop(columns='ordem')
             resultado = combinado2
 
-    # ---------------- Criterio extra: navegacao recente (RD Station) ----------------
-    if rd_df is not None and len(rd_df):
+    # ---------------- Criterio extra: navegacao recente (GA4 ou, na falta, RD Station) ----------------
+    tem_sinal_navegacao = bool(ga4_navegou_hashes) or (rd_df is not None and len(rd_df))
+    if ga4_navegou_hashes:
+        resultado['Navegou_Recente'] = match_ga4_navegou(resultado['Email_norm'], ga4_navegou_hashes)
+        resultado['Dias_Desde_Ultima_Navegacao_RD'] = np.nan
+        funil.append((f"+ Navegaram no site nos ultimos {dias_navegacao}d (GA4)",
+                      int(resultado['Navegou_Recente'].sum())))
+    elif rd_df is not None and len(rd_df):
         resultado = resultado.merge(rd_df, on='Email_norm', how='left')
         resultado['Dias_Desde_Ultima_Navegacao_RD'] = (
             (ref_date if ref_date is not None else pd.Timestamp.today().normalize())
@@ -432,7 +528,7 @@ def gerar_publico(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw
     else:
         resultado['_ordem_origem'] = 0
 
-    if rd_df is not None and len(rd_df):
+    if tem_sinal_navegacao:
         resultado['_ordem_nav'] = (~resultado['Navegou_Recente'].fillna(False)).astype(int)
         resultado = resultado.sort_values(
             ['_ordem_origem', '_ordem_nav', 'RFV_score'], ascending=[True, True, False])
@@ -484,7 +580,8 @@ def _engagement_rank(segmento):
 
 def gerar_publico_email(spot_df, lead_master, exact_keywords_raw, similar_keywords_raw, familia,
                          tamanho_alvo=None, min_pedidos=3, dias_exclusao=30, ref_date=None,
-                         rd_abertos_emails=None, rd_df=None, dias_navegacao=360):
+                         rd_abertos_emails=None, rd_df=None, dias_navegacao=360,
+                         ga4_navegou_hashes=None):
     """
     Gera uma base de e-mail (2a via de disparo, complementar ao WhatsApp e a RD Station),
     usando o Lead Score como base mae (todos os leads com opt-in de e-mail = 'Sim'),
@@ -582,7 +679,13 @@ def gerar_publico_email(spot_df, lead_master, exact_keywords_raw, similar_keywor
                      origem_c: 2, 'Camada D - Engajado sem compra': 3}
     combinado['_ordem'] = combinado['Origem'].map(ordem_origem).fillna(9)
 
-    if rd_df is not None and len(rd_df):
+    if ga4_navegou_hashes:
+        combinado['Navegou_Recente'] = match_ga4_navegou(combinado['Email_norm'], ga4_navegou_hashes)
+        combinado['Dias_Desde_Ultima_Navegacao_RD'] = np.nan
+        combinado['_ordem_nav'] = (~combinado['Navegou_Recente'].fillna(False)).astype(int)
+        combinado = combinado.sort_values(
+            ['_ordem', '_eng_rank', '_ordem_nav', 'RFV_score'], ascending=[True, True, True, False])
+    elif rd_df is not None and len(rd_df):
         combinado = combinado.merge(rd_df, on='Email_norm', how='left')
         combinado['Dias_Desde_Ultima_Navegacao_RD'] = (
             (ref_date if ref_date is not None else pd.Timestamp.today().normalize())

@@ -8,6 +8,7 @@ import streamlit as st
 from segmentation import (
     gerar_publico, gerar_publico_email, load_spot_pedidos, load_leadscore,
     load_rd_station, load_rd_abertos, FAMILIAS,
+    ga4_credentials_available, load_ga4_navegou_recente,
 )
 
 st.set_page_config(page_title="Publico Segmentado - Clube do Malte", layout="wide")
@@ -44,6 +45,40 @@ def _load_rd_cached(path_str, _mtime):
     return load_rd_station(path_str)
 
 
+def _ga4_config():
+    """Le a configuracao do GA4 dos Secrets do Streamlit (Settings -> Secrets). Retorna
+    (service_account_info, property_id, audience_id) ou (None, None, None) se nao
+    estiver configurado - nesse caso o app cai de volta pro upload manual da RD Station,
+    sem quebrar."""
+    info = st.secrets.get("ga4_service_account")
+    property_id = st.secrets.get("GA4_PROPERTY_ID")
+    audience_id = st.secrets.get("GA4_AUDIENCE_ID")
+    return info, property_id, audience_id
+
+
+@st.cache_data(ttl=21600, show_spinner="Buscando quem navegou recentemente no site (GA4)...")
+def _load_ga4_navegou_cached(_info, property_id, audience_id):
+    # o parametro comeca com "_" pra dizer ao st.cache_data pra nao tentar fazer hash
+    # dele (e um dict com a chave privada da service account, nao serializavel/estavel
+    # o suficiente pro cache) - o cache efetivamente fica por (property_id, audience_id)
+    # e dura 6h, pra nao recriar um audience export novo a cada clique.
+    return load_ga4_navegou_recente(_info, property_id, audience_id)
+
+
+def _get_ga4_navegou_hashes():
+    """Tenta buscar o set de hashes de e-mail via GA4 (Audience Export API). Retorna
+    (hashes_ou_None, mensagem_de_erro_ou_None). Nunca levanta excecao - quem chama
+    trata a falha caindo de volta pro upload manual da RD Station, se houver."""
+    info, property_id, audience_id = _ga4_config()
+    if not ga4_credentials_available(info, property_id, audience_id):
+        return None, None
+    try:
+        hashes = _load_ga4_navegou_cached(info, property_id, audience_id)
+        return hashes, None
+    except Exception as e:
+        return None, str(e)
+
+
 def _base_card(label, path: Path, key_prefix, help_text):
     exists = path.exists()
     if exists:
@@ -72,28 +107,42 @@ with st.sidebar:
     _base_card("Lead Score", LEAD_PATH, "lead",
                "Fica fixa no app entre uma geracao e outra. So suba de novo quando tiver uma exportacao mais recente.")
 
-    st.subheader("RD Station - Navegacao (semanal)")
-    if RD_PATH.exists():
-        st.success(f"RD Station: OK — atualizada em {_fmt_ts(RD_PATH)}")
+    st.subheader("Navegacao recente no site")
+    _ga4_info, _ga4_property_id, _ga4_audience_id = _ga4_config()
+    ga4_ok = ga4_credentials_available(_ga4_info, _ga4_property_id, _ga4_audience_id)
+    if ga4_ok:
+        st.success("Conectado automaticamente via GA4 — nao precisa subir arquivo. "
+                    "(atualiza a cada 6h; se a conexao falhar na hora de gerar, cai pro "
+                    "upload manual da RD Station abaixo, se houver um carregado.)")
     else:
-        st.info("RD Station: opcional. Sem ela, o app roda normalmente sem o criterio de navegacao.")
-    rd_up = st.file_uploader("Subir planilha/CSV de navegacao da RD Station", type=["csv", "xlsx"], key="rd_up")
-    if rd_up is not None:
-        suffix = ".xlsx" if rd_up.name.lower().endswith("xlsx") else ".csv"
-        rd_target = DATA_DIR / f"rd_station{suffix}"
-        rd_target.write_bytes(rd_up.getbuffer())
-        if rd_target != RD_PATH and RD_PATH.exists():
-            RD_PATH.unlink()
-        st.cache_data.clear()
-        st.success("Dados da RD Station atualizados.")
-        st.rerun()
+        st.info("GA4 nao configurado nos Secrets do Streamlit. Usando upload manual da "
+                 "RD Station como criterio de navegacao (opcional).")
+    with st.expander("Upload manual da RD Station (fallback, so precisa se o GA4 nao estiver configurado)"):
+        if RD_PATH.exists():
+            st.success(f"RD Station: OK — atualizada em {_fmt_ts(RD_PATH)}")
+        else:
+            st.caption("Sem arquivo carregado.")
+        rd_up = st.file_uploader("Subir planilha/CSV de navegacao da RD Station", type=["csv", "xlsx"], key="rd_up")
+        if rd_up is not None:
+            suffix = ".xlsx" if rd_up.name.lower().endswith("xlsx") else ".csv"
+            rd_target = DATA_DIR / f"rd_station{suffix}"
+            rd_target.write_bytes(rd_up.getbuffer())
+            if rd_target != RD_PATH and RD_PATH.exists():
+                RD_PATH.unlink()
+            st.cache_data.clear()
+            st.success("Dados da RD Station atualizados.")
+            st.rerun()
 
     st.header("2. Parametros do processo")
     tamanho = st.number_input("Tamanho do publico", min_value=50, max_value=2000, value=400, step=50)
     min_pedidos = st.number_input("Min. pedidos totais (criterio 3)", min_value=1, max_value=10, value=3)
     dias_exclusao = st.number_input("Dias sem comprar o produto exato (criterio 4)", min_value=0, max_value=180, value=30)
     limite_fallback = st.number_input("Gatilho do fallback (elegiveis min. na Fase 1)", min_value=10, max_value=1000, value=100)
-    dias_navegacao = st.number_input("Dias p/ considerar navegacao recente (RD Station)", min_value=30, max_value=720, value=360)
+    dias_navegacao = st.number_input(
+        "Dias p/ considerar navegacao recente", min_value=30, max_value=720, value=360,
+        help="Via GA4, esse valor e so pra exibicao/funil — a janela real e a configurada "
+             "na audiencia 'Navegou Recente' dentro do proprio GA4. Via upload manual da "
+             "RD Station, esse valor e usado de fato pra filtrar.")
 
 st.header("Oferta")
 col1, col2 = st.columns(2)
@@ -119,8 +168,13 @@ if rodar:
     else:
         spot_df = _load_spot_cached(str(SPOT_PATH), SPOT_PATH.stat().st_mtime)
         lead_master = _load_lead_cached(str(LEAD_PATH), LEAD_PATH.stat().st_mtime)
+
+        ga4_hashes, ga4_erro = _get_ga4_navegou_hashes()
+        if ga4_erro:
+            st.warning(f"Nao consegui buscar a navegacao recente via GA4 ({ga4_erro}). "
+                       "Seguindo sem esse criterio (ou usando o upload manual da RD Station, se houver).")
         rd_df = None
-        if RD_PATH.exists():
+        if not ga4_hashes and RD_PATH.exists():
             rd_df = _load_rd_cached(str(RD_PATH), RD_PATH.stat().st_mtime)
 
         with st.spinner("Calculando o publico..."):
@@ -135,6 +189,7 @@ if rodar:
                 limite_fallback=int(limite_fallback),
                 rd_df=rd_df,
                 dias_navegacao=int(dias_navegacao),
+                ga4_navegou_hashes=ga4_hashes,
             )
 
         tabela = resultado['tabela']
@@ -146,7 +201,12 @@ if rodar:
             'fallback_camada_a': 'Fallback acionado - Camada A (estilo similar)',
             'fallback_camada_a_b': 'Fallback acionado - Camadas A + B (estilo + familia)',
         }[modo]
-        aviso_rd = "" if rd_df is not None else " (sem dado de navegacao da RD Station nesta rodada)"
+        if ga4_hashes:
+            aviso_rd = f" (navegacao via GA4 — {len(ga4_hashes)} usuarios na audiencia)"
+        elif rd_df is not None:
+            aviso_rd = " (navegacao via upload manual da RD Station)"
+        else:
+            aviso_rd = " (sem dado de navegacao nesta rodada)"
         st.success(f"Publico gerado: {len(tabela)} contatos. Modo: {modo_label}{aviso_rd}")
 
         st.subheader("Funil de aplicacao dos criterios")
@@ -202,8 +262,13 @@ if gerar_email:
     else:
         spot_df = _load_spot_cached(str(SPOT_PATH), SPOT_PATH.stat().st_mtime)
         lead_master = _load_lead_cached(str(LEAD_PATH), LEAD_PATH.stat().st_mtime)
+
+        ga4_hashes, ga4_erro = _get_ga4_navegou_hashes()
+        if ga4_erro:
+            st.warning(f"Nao consegui buscar a navegacao recente via GA4 ({ga4_erro}). "
+                       "Seguindo sem esse criterio (ou usando o upload manual da RD Station, se houver).")
         rd_df = None
-        if RD_PATH.exists():
+        if not ga4_hashes and RD_PATH.exists():
             rd_df = _load_rd_cached(str(RD_PATH), RD_PATH.stat().st_mtime)
 
         rd_abertos_emails = None
@@ -229,12 +294,19 @@ if gerar_email:
                 rd_abertos_emails=rd_abertos_emails,
                 rd_df=rd_df,
                 dias_navegacao=int(dias_navegacao),
+                ga4_navegou_hashes=ga4_hashes,
             )
 
         tabela_email = resultado_email['tabela']
         funil_email = resultado_email['funil']
 
-        st.success(f"Base de e-mail gerada: {len(tabela_email)} contatos.")
+        if ga4_hashes:
+            aviso_rd_email = f" (navegacao via GA4 — {len(ga4_hashes)} usuarios na audiencia)"
+        elif rd_df is not None:
+            aviso_rd_email = " (navegacao via upload manual da RD Station)"
+        else:
+            aviso_rd_email = " (sem dado de navegacao nesta rodada)"
+        st.success(f"Base de e-mail gerada: {len(tabela_email)} contatos.{aviso_rd_email}")
 
         st.subheader("Funil de aplicacao dos criterios (e-mail)")
         funil_email_df = pd.DataFrame(funil_email, columns=["Etapa", "Qtd. de clientes"])
